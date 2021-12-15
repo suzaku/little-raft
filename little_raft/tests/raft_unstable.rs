@@ -1,10 +1,11 @@
 use crossbeam_channel as channel;
 use crossbeam_channel::{unbounded, Receiver, Sender};
+use bytes::Bytes;
 use little_raft::{
     cluster::Cluster,
     message::Message,
     replica::Replica,
-    state_machine::{StateMachine, StateMachineTransition, TransitionState},
+    state_machine::{StateMachine, StateMachineTransition, TransitionState, Snapshot},
 };
 use std::sync::{Arc, Mutex};
 
@@ -61,6 +62,18 @@ impl StateMachine<ArithmeticOperation> for Calculator {
         let cur = self.pending_transitions.clone();
         self.pending_transitions = Vec::new();
         cur
+    }
+
+    fn load_snapshot(&mut self) -> Option<Snapshot> {
+        None
+    }
+
+    fn create_snapshot(&mut self, index: usize, term: usize) -> Snapshot {
+        Snapshot {
+            last_included_index: index,
+            last_included_term: term,
+            data: Bytes::new(),
+        }
     }
 }
 
@@ -300,6 +313,7 @@ fn run_replicas() {
                 local_peer_ids,
                 cluster,
                 state_machine,
+                1,
                 noop.clone(),
                 HEARTBEAT_TIMEOUT,
                 (MIN_ELECTION_TIMEOUT, MAX_ELECTION_TIMEOUT),

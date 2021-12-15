@@ -1,7 +1,7 @@
 use crate::{
     cluster::Cluster,
     message::{LogEntry, Message},
-    state_machine::{StateMachine, StateMachineTransition, TransitionState},
+    state_machine::{Snapshot, StateMachine, StateMachineTransition, TransitionState},
     timer::Timer,
 };
 use crossbeam_channel::{Receiver, Select};
@@ -27,10 +27,10 @@ pub type ReplicaID = usize;
 /// to maintain the consistency of the user-defined StateMachine across the
 /// cluster. It uses the user-defined Cluster implementation to talk to other
 /// Replicas, be it over the network or pigeon post.
-pub struct Replica<S, T, C>
+pub struct Replica<T, C, M>
 where
     T: StateMachineTransition,
-    S: StateMachine<T>,
+    M: StateMachine<T>,
     C: Cluster<T>,
 {
     /// ID of this Replica.
@@ -40,7 +40,7 @@ where
     peer_ids: Vec<ReplicaID>,
 
     /// User-defined state machine that the cluster Replicates.
-    state_machine: Arc<Mutex<S>>,
+    state_machine: Arc<Mutex<M>>,
 
     /// Interface a Replica uses to communicate with the rest of the cluster.
     cluster: Arc<Mutex<C>>,
@@ -89,12 +89,18 @@ where
     /// If no heartbeat message is received by the deadline, the Replica will
     /// start an election.
     next_election_deadline: Instant,
+
+    snapshot_delta: usize,
+
+    snapshot: Option<Snapshot>,
+
+    index_offset: usize,
 }
 
-impl<S, T, C> Replica<S, T, C>
+impl<T, C, M> Replica<T, C, M>
 where
     T: StateMachineTransition,
-    S: StateMachine<T>,
+    M: StateMachine<T>,
     C: Cluster<T>,
 {
     /// Create a new Replica.
@@ -127,11 +133,19 @@ where
         id: ReplicaID,
         peer_ids: Vec<ReplicaID>,
         cluster: Arc<Mutex<C>>,
-        state_machine: Arc<Mutex<S>>,
+        state_machine: Arc<Mutex<M>>,
+        snapshot_delta: usize,
         noop_transition: T,
         heartbeat_timeout: Duration,
         election_timeout_range: (Duration, Duration),
-    ) -> Replica<S, T, C> {
+    ) -> Replica<T, C, M> {
+        let snapshot = state_machine.lock().unwrap().load_snapshot();
+        let index_offset = if let Some(ref snapshot) = snapshot {
+            snapshot.last_included_index
+        } else {
+            0
+        };
+
         Replica {
             state_machine: state_machine,
             cluster: cluster,
@@ -154,6 +168,9 @@ where
             election_timeout: election_timeout_range,
             heartbeat_timer: Timer::new(heartbeat_timeout),
             next_election_deadline: Instant::now(),
+            snapshot: snapshot,
+            snapshot_delta: snapshot_delta,
+            index_offset: index_offset,
         }
     }
 
@@ -225,8 +242,8 @@ where
         self.broadcast_message(|peer_id: ReplicaID| Message::AppendEntryRequest {
             term: self.current_term,
             from_id: self.id,
-            prev_log_index: self.next_index[&peer_id] - 1,
-            prev_log_term: self.log[self.next_index[&peer_id] - 1].term,
+            prev_log_index: self.next_index[&peer_id] - 1 + self.index_offset,
+            prev_log_term: self.log[self.next_index[&peer_id] - 1 - self.index_offset].term,
             entries: self.get_entries_for_peer(peer_id),
             commit_index: self.commit_index,
         });
@@ -315,13 +332,14 @@ where
 
     // Get log entries that have not been acknowledged by the peer.
     fn get_entries_for_peer(&self, peer_id: ReplicaID) -> Vec<LogEntry<T>> {
-        self.log[self.next_index[&peer_id]..self.log.len()].to_vec()
+        self.log[self.next_index[&peer_id] - self.index_offset..self.log.len()].to_vec()
     }
 
     // Apply entries that are ready to be applied.
     fn apply_ready_entries(&mut self) {
         // Move the commit index to the latest log index that has been
         // replicated on the majority of the replicas.
+        let mut state_machine = self.state_machine.lock().unwrap();
         if self.state == State::Leader && self.commit_index < self.log.len() - 1 {
             let mut n = self.log.len() - 1;
             let old_commit_index = self.commit_index;
@@ -333,7 +351,7 @@ where
                     );
 
                 if num_replications * 2 >= self.peer_ids.len()
-                    && self.log[n].term == self.current_term
+                    && self.log[n - self.index_offset].term == self.current_term
                 {
                     self.commit_index = n;
                 }
@@ -341,9 +359,8 @@ where
             }
 
             for i in old_commit_index + 1..=self.commit_index {
-                let mut state_machine = self.state_machine.lock().unwrap();
                 state_machine.register_transition_state(
-                    self.log[i].transition.get_id(),
+                    self.log[i - self.index_offset].transition.get_id(),
                     TransitionState::Committed,
                 );
             }
@@ -352,19 +369,47 @@ where
         // Apply entries that are behind the currently committed index.
         while self.commit_index > self.last_applied {
             self.last_applied += 1;
-            let mut state_machine = self.state_machine.lock().unwrap();
-            state_machine.apply_transition(self.log[self.last_applied].transition.clone());
+            state_machine.apply_transition(
+                self.log[self.last_applied - self.index_offset]
+                    .transition
+                    .clone(),
+            );
             state_machine.register_transition_state(
-                self.log[self.last_applied].transition.get_id(),
+                self.log[self.last_applied - self.index_offset]
+                    .transition
+                    .get_id(),
                 TransitionState::Applied,
             );
-        }
+
+            if self.commit_index - self.last_applied == 1 && self.snapshot_delta > 0 {
+                let curr_delta = if let Some(snapshot) = &self.snapshot {
+                    self.last_applied - snapshot.last_included_index
+                } else {
+                    self.last_applied
+                };
+    
+                if curr_delta >= self.snapshot_delta {
+                    println!("snapshotting!!!");
+                    let last_applied = self.last_applied;
+                    self.snapshot = Some(state_machine.create_snapshot(
+                        last_applied,
+                        self.log[last_applied - self.index_offset].term,
+                    ));
+                    println!("{:?}", self.log);
+                    self.log.retain(|l| l.index > last_applied);
+                    self.index_offset = last_applied+1;
+                    println!("{}", self.index_offset);
+                    println!("{:?}", self.log);
+                }
+            }
+        }        
     }
 
     fn load_new_transitions(&mut self) {
         // Load new transitions. Ignore the transitions if the replica is not
         // the Leader.
-        let transitions = self.state_machine.lock().unwrap().get_pending_transitions();
+        let mut state_machine = self.state_machine.lock().unwrap();
+        let transitions = state_machine.get_pending_transitions();
         for transition in transitions {
             if self.state == State::Leader {
                 self.log.push(LogEntry {
@@ -373,7 +418,6 @@ where
                     term: self.current_term,
                 });
 
-                let mut state_machine = self.state_machine.lock().unwrap();
                 state_machine
                     .register_transition_state(transition.get_id(), TransitionState::Queued);
             }
@@ -450,12 +494,13 @@ where
         }
 
         if self.voted_for == None || self.voted_for == Some(from_id) {
-            if self.log[self.log.len() - 1].index <= last_log_index
-                && self.log[self.log.len() - 1].term <= last_log_term
+            if self.log[self.log.len() - 1 - self.index_offset].index <= last_log_index
+                && self.log[self.log.len() - 1 - self.index_offset].term <= last_log_term
             {
                 // If the criteria are met, grant the vote.
-                self.cluster.lock().unwrap().register_leader(None);
-                self.cluster.lock().unwrap().send_message(
+                let mut cluster = self.cluster.lock().unwrap();
+                cluster.register_leader(None);
+                cluster.send_message(
                     from_id,
                     Message::VoteResponse {
                         from_id: self.id,
@@ -512,7 +557,8 @@ where
             return;
         // If our log doesn't contain an entry at prev_log_index with the
         // prev_log_term term, reply false.
-        } else if prev_log_index >= self.log.len() || self.log[prev_log_index].term != prev_log_term
+        } else if prev_log_index >= self.log.len()
+            || self.log[prev_log_index - self.index_offset].term != prev_log_term
         {
             self.cluster.lock().unwrap().send_message(
                 from_id,
@@ -520,7 +566,7 @@ where
                     from_id: self.id,
                     term: self.current_term,
                     success: false,
-                    last_index: self.log.len() - 1,
+                    last_index: self.log.len() + self.index_offset - 1,
                     mismatch_index: Some(prev_log_index),
                 },
             );
@@ -529,12 +575,14 @@ where
 
         for entry in entries {
             // Drop local inconsistent logs.
-            if entry.index < self.log.len() && entry.term != self.log[entry.index].term {
-                self.log.truncate(entry.index);
+            if entry.index < self.log.len() + self.index_offset
+                && entry.term != self.log[entry.index - self.index_offset].term
+            {
+                self.log.truncate(entry.index - self.index_offset);
             }
 
             // Push received logs.
-            if entry.index == self.log.len() {
+            if entry.index == self.log.len() + self.index_offset {
                 self.log.push(entry);
             }
         }
@@ -542,14 +590,17 @@ where
         // Update local commit index to either the received commit index or the
         // latest local log position, whichever is smaller.
         if commit_index > self.commit_index && self.log.len() != 0 {
-            self.commit_index = if commit_index < self.log[self.log.len() - 1].index {
-                commit_index
-            } else {
-                self.log[self.log.len() - 1].index
-            }
+            self.commit_index =
+                if commit_index < self.log[self.log.len() - 1 - self.index_offset].index {
+                    commit_index
+                } else {
+                    self.log[self.log.len() - 1 - self.index_offset].index
+                }
         }
-        self.cluster.lock().unwrap().register_leader(Some(from_id));
-        self.cluster.lock().unwrap().send_message(
+
+        let mut cluster = self.cluster.lock().unwrap();
+        cluster.register_leader(Some(from_id));
+        cluster.send_message(
             from_id,
             Message::AppendEntryResponse {
                 from_id: self.id,
@@ -588,6 +639,7 @@ where
             ),
             Message::AppendEntryResponse { .. } => { /* ignore */ }
             Message::VoteResponse { .. } => { /* ignore */ }
+            _ => {}
         }
     }
 
@@ -605,6 +657,7 @@ where
                 vote_granted,
             } => self.process_vote_response_as_candidate(from_id, term, vote_granted),
             Message::AppendEntryResponse { .. } => { /* ignore */ }
+            _ => {}
         }
     }
 
@@ -723,7 +776,7 @@ where
         self.broadcast_message(|_: usize| Message::VoteRequest {
             from_id: self.id,
             term: self.current_term,
-            last_log_index: self.log.len() - 1,
+            last_log_index: self.log.len() + self.index_offset - 1,
             last_log_term: self.log[self.log.len() - 1].term,
         });
 

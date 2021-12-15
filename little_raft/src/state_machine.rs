@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use std::fmt::Debug;
 
 /// TransitionState describes the state of a particular transition.
@@ -29,9 +30,15 @@ pub trait StateMachineTransition: Clone + Debug {
     fn get_id(&self) -> Self::TransitionID;
 }
 
+pub struct Snapshot {
+    pub last_included_index: usize,
+    pub last_included_term: usize,
+    pub data: Bytes,
+}
+
 /// StateMachine describes a user-defined state machine that is replicated
-/// across the cluster. Raft can Replica whatever distributed state machine can
-/// implement this trait.
+/// across the cluster. Raft can replicate whatever distributed state machine
+/// can implement this trait.
 pub trait StateMachine<T>
 where
     T: StateMachineTransition,
@@ -53,4 +60,8 @@ where
     /// discard them. get_pending_transitions must not return the same
     /// transition twice.
     fn get_pending_transitions(&mut self) -> Vec<T>;
+
+    fn load_snapshot(&mut self) -> Option<Snapshot>;
+
+    fn create_snapshot(&mut self, index: usize, term: usize) -> Snapshot;
 }
