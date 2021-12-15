@@ -341,7 +341,7 @@ where
         // replicated on the majority of the replicas.
         let mut state_machine = self.state_machine.lock().unwrap();
         if self.state == State::Leader && self.commit_index < self.log.len() - 1 {
-            let mut n = self.log.len() - 1;
+            let mut n = self.log.len() - 1 + self.index_offset;
             let old_commit_index = self.commit_index;
             while n > self.commit_index {
                 let num_replications =
